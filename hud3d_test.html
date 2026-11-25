@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Moonbeam HUD 3D Test</title>
+  <link href="https://fonts.googleapis.com/css2?family=Bitcount+Single&display=swap" rel="stylesheet">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #003049;
+    }
+
+    #hud3d {
+      position: fixed;
+      top: 0;
+      left: 0;
+      display: block;
+    }
+
+    #stats {
+      position: fixed;
+      top: 8px;
+      left: 8px;
+      padding: 6px 8px;
+      font: 12px monospace;
+      color: #d9f5f0;
+      background: rgba(0, 0, 0, 0.55);
+      white-space: pre;
+      pointer-events: none;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="hud3d"></canvas>
+  <div id="stats">Loading HUD...</div>
+
+  <script src="three-bundle.js"></script>
+  <script src="hud3d.js"></script>
+  <script>
+
+// ============================================================================
+// TEST SETTINGS
+// ============================================================================
+
+// ?model=Assets/Models/HUD_1.glb  to try a different file
+const modelParam = new URLSearchParams(location.search).get('model');
+
+// Stand-ins for the real loadout state table: which pieces belong to which page.
+// (My best guess from the two PNG HUDs. Fix the lists to match your model)
+const MENU_ONLY = ['BoomerangScreen', 'BigRedButton', 'BigRedButtonSetting', 'Joystick'];
+const GAME_ONLY = [
+    'Radio', 'RadioDial', 'RadioPresets1', 'RadioPresets2', 'RadioPresets3', 'RadioAMFMHousing', 'RadioAMFMSlider',
+    'Points', 'LifeScreen', 'CenterConsoleScreen', 'PowerupScreen', 'DialScreens',
+    'RocketButton', 'ButtonBack', 'ButtonRefresh', 'ButtonPlayPause', 'Pause'
+];
+const ALWAYS_HIDDEN = ['Play'];            // Play swaps in for Pause later
+
+let hud3d = null;
+let loadout = 'game';
+let conservatoryShown = false;
+let hover = null;                          // { screen, x, y } while the pointer is over a screen
+const statsEl = document.getElementById('stats');
+
+// ============================================================================
+// TEST PATTERN
+// ============================================================================
+
+// Draws a labeled pattern on a screen: name, size, grid, colored corners, and a cyan bar along the TOP edge.
+// If the pattern looks mirrored, rotated, or squashed on the model, the UVs or canvas sizing are off
+function paintScreen(screen, t) {
+    const ctx = screen.ctx;
+    const w = screen.width;
+    const h = screen.height;
+    ctx.save();
+
+    ctx.fillStyle = '#10202c';
+    ctx.fillRect(0, 0, w, h);
+
+    // Grid
+    const step = Math.max(8, Math.round(Math.min(w, h) / 4));
+    ctx.strokeStyle = 'rgba(217, 245, 240, 0.12)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = step; x < w; x += step) { ctx.moveTo(x, 0); ctx.lineTo(x, h); }
+    for (let y = step; y < h; y += step) { ctx.moveTo(0, y); ctx.lineTo(w, y); }
+    ctx.stroke();
+
+    // Border, top edge bar, and corner markers
+    ctx.strokeStyle = '#6baa75';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(1, 1, w - 2, h - 2);
+    ctx.fillStyle = '#00b4d8';
+    ctx.fillRect(0, 0, w, Math.max(2, Math.round(h * 0.04)));
+    const m = Math.max(4, Math.round(Math.min(w, h) * 0.12));
+    ctx.fillStyle = '#ff4a4a'; ctx.fillRect(0, 0, m, m);                 // Top left: red
+    ctx.fillStyle = '#4aff90'; ctx.fillRect(w - m, 0, m, m);             // Top right: green
+    ctx.fillStyle = '#4a90ff'; ctx.fillRect(0, h - m, m, m);             // Bottom left: blue
+    ctx.fillStyle = '#ffe04a'; ctx.fillRect(w - m, h - m, m, m);         // Bottom right: yellow
+
+    // Name, shrunk to fit
+    let fs = Math.floor(h * 0.34);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#d9f5f0';
+    ctx.font = fs + 'px "Bitcount Single", monospace';
+    while (fs > 6 && ctx.measureText(screen.name).width > w * 0.8) {
+        fs -= 1;
+        ctx.font = fs + 'px "Bitcount Single", monospace';
+    }
+    ctx.fillText(screen.name, w / 2, h * (h >= 60 ? 0.42 : 0.5));
+    if (h >= 60) {
+        ctx.font = Math.max(6, Math.floor(fs * 0.55)) + 'px "Bitcount Single", monospace';
+        ctx.fillStyle = '#6baa75';
+        ctx.fillText(w + ' x ' + h, w / 2, h * 0.66);
+    }
+
+    // Moving ball on the live screen, so you can see it update every frame
+    if (screen.live) {
+        const bx = w / 2 + Math.sin(t / 1000) * w * 0.4;
+        const by = h / 2 + Math.cos(t / 700) * h * 0.3;
+        ctx.fillStyle = '#e8b946';
+        ctx.beginPath();
+        ctx.arc(bx, by, h * 0.04, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Crosshair where the pointer is
+    if (hover && hover.screen === screen) {
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(hover.x, 0); ctx.lineTo(hover.x, h);
+        ctx.moveTo(0, hover.y); ctx.lineTo(w, hover.y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(hover.x, hover.y, Math.max(3, h * 0.05), 0, Math.PI * 2);
+        ctx.stroke();
+    }
+
+    ctx.restore();
+}
+
+function repaintAll() {
+    for (const name in hud3d.screens) {
+        paintScreen(hud3d.screens[name], performance.now());
+        hud3d.screens[name].markDirty();
+    }
+}
+
+// ============================================================================
+// LOADOUT
+// ============================================================================
+
+function applyLoadout() {
+    MENU_ONLY.forEach(n => hud3d.setVisible(n, loadout === 'menu'));
+    GAME_ONLY.forEach(n => hud3d.setVisible(n, loadout === 'game'));
+    ALWAYS_HIDDEN.forEach(n => hud3d.setVisible(n, false));
+    hud3d.setVisible('RightScreen', conservatoryShown);
+}
+
+// ============================================================================
+// START
+// ============================================================================
+
+initHud3D(document.getElementById('hud3d'), modelParam ? { modelUrl: modelParam } : {}).then(hud => {
+    hud3d = hud;
+    applyLoadout();
+
+    // Wait for the font so the static screens don't get painted with the fallback one
+    (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(repaintAll);
+
+    // Pointer: report what is under it, and show where it lands on the canvas
+    hud.canvas.addEventListener('pointermove', (e) => {
+        const hit = hud.pick(e.clientX, e.clientY);
+        const prev = hover && hover.screen;
+        hover = hit && hit.screen ? { screen: hit.screen, x: hit.canvasX, y: hit.canvasY, name: hit.name } : null;
+        hud.canvas.style.cursor = hit ? 'crosshair' : 'default';
+        hud._lastHitName = hit ? hit.name : '-';
+        if (prev && (!hover || hover.screen !== prev)) { paintScreen(prev, performance.now()); prev.markDirty(); }
+        if (hover && !hover.screen.live) { paintScreen(hover.screen, performance.now()); hover.screen.markDirty(); }
+    });
+
+    window.addEventListener('keydown', (e) => {
+        const k = e.key.toLowerCase();
+        if (k === 'f') hud.setFit(hud.fit === 'contain' ? 'cover' : 'contain');
+        if (k === 'l') { loadout = loadout === 'game' ? 'menu' : 'game'; applyLoadout(); }
+        if (k === 'h') { conservatoryShown = !conservatoryShown; applyLoadout(); }
+    });
+
+    // Frame loop + stats
+    let frames = 0;
+    let lastStats = performance.now();
+    function frame(now) {
+        paintScreen(hud.screens.MainScreen, now);           // The one live screen
+        hud.render();
+        frames++;
+        if (now - lastStats >= 500) {
+            const fps = Math.round(frames * 1000 / (now - lastStats));
+            const info = hud.renderer.info;
+            const pixels = Object.values(hud.screens).reduce((sum, s) => sum + s.width * s.height, 0);
+            statsEl.textContent =
+                fps + ' fps   ' + info.render.calls + ' draw calls   ' + Math.round(info.render.triangles / 1000) + 'k tris\n' +
+                'canvases: ' + Object.keys(hud.screens).length + ' (' + (pixels / 1e6).toFixed(2) + ' Mpx total)   uploaded per frame: ' +
+                (hud.screens.MainScreen.width * hud.screens.MainScreen.height / 1e6).toFixed(2) + ' Mpx\n' +
+                'fit: ' + hud.fit + '   loadout: ' + loadout + '   under pointer: ' + (hud._lastHitName || '-') +
+                (hover ? '  canvas ' + Math.round(hover.x) + ', ' + Math.round(hover.y) : '') + '\n' +
+                '[F] contain/cover   [L] game/menu loadout   [H] conservatory screen';
+            frames = 0;
+            lastStats = now;
+        }
+        requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+}).catch(err => {
+    statsEl.textContent = 'HUD failed to load: ' + err.message +
+        '\nLooking for the model at ' + (modelParam || HUD3D_MODEL_URL) +
+        '\n(Outside Electron, serve this folder over http, e.g. "npx http-server")';
+    console.error(err);
+});
+
+  </script>
+</body>
+</html>
