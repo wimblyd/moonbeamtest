@@ -51,8 +51,8 @@
 // TEST SETTINGS
 // ============================================================================
 
-// ?model=Models/HUD.glb  to try a different file
-const modelParam = new URLSearchParams(location.search).get('model');
+// Where the model lives next to this page. ?model=Some/Other.glb overrides it
+const modelUrl = new URLSearchParams(location.search).get('model') || 'Models/HUD.glb';
 
 // Stand-ins for the real loadout state table: which pieces belong to which page.
 // (My best guess from the two PNG HUDs. Fix the lists to match your model)
@@ -69,6 +69,15 @@ let loadout = 'game';
 let conservatoryShown = false;
 let hover = null;                          // { screen, x, y } while the pointer is over a screen
 const statsEl = document.getElementById('stats');
+
+// Pre-flight: say what is missing instead of sitting on "Loading HUD..." forever
+const missing = [];
+if (typeof THREE === 'undefined') missing.push('three-bundle.js');
+if (typeof initHud3D === 'undefined') missing.push('hud3d.js');
+if (missing.length) {
+    statsEl.textContent = 'Missing: ' + missing.join(', ') + '\nThey need to sit in the same folder as this page (see the browser console for 404s).';
+    throw new Error('Missing ' + missing.join(', '));
+}
 
 // ============================================================================
 // TEST PATTERN
@@ -171,7 +180,7 @@ function applyLoadout() {
 // START
 // ============================================================================
 
-initHud3D(document.getElementById('hud3d'), modelParam ? { modelUrl: modelParam } : {}).then(hud => {
+initHud3D(document.getElementById('hud3d'), { modelUrl: modelUrl }).then(hud => {
     hud3d = hud;
     applyLoadout();
 
@@ -222,7 +231,7 @@ initHud3D(document.getElementById('hud3d'), modelParam ? { modelUrl: modelParam 
     requestAnimationFrame(frame);
 }).catch(err => {
     statsEl.textContent = 'HUD failed to load: ' + err.message +
-        '\nLooking for the model at ' + (modelParam || HUD3D_MODEL_URL) +
+        '\nLooking for the model at ' + modelUrl +
         '\n(Outside Electron, serve this folder over http, e.g. "npx http-server")';
     console.error(err);
 });
