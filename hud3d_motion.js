@@ -20,7 +20,7 @@
 // MOTION CONSTANTS
 // ============================================================================
 
-const HUD3D_MOTION_VERSION = '2026-11-26 flip direction + MHUD names';   // Shown on the test page
+const HUD3D_MOTION_VERSION = '2026-11-26b rest offsets + tucked swing';   // Shown on the test page
 const HUD3D_SURFACE_Y = 0.0;                     // Anything below this is hidden under the frames. Rising pieces start there
 const HUD3D_PHASE_GAP = 0.05;                    // Pause between the beats, in seconds
 const HUD3D_FLIP_DURATION = 0.9;                 // How long a frame piece takes to flip
@@ -31,6 +31,13 @@ const HUD3D_SWING_DIRECTION = 1;                // 1 or -1: which way the mode s
 const HUD3D_FRAME_AXIS = { y: -0.08, z: -2.52 }; // The line every frame piece flips around (bottom of the slab, center of the panel)
 const HUD3D_DEFAULT_EASE = 'inOut';
 const HUD3D_EXPAND_LINE = 0.03;                  // Screens open as a thin line first (fraction of their height)
+
+// Nudges applied to a piece's resting position (world units: x right, y toward the camera, z toward the bottom of the screen).
+// A quick way to fix overlaps without a trip back to Blender
+const HUD3D_REST_OFFSETS = {
+    LifeScreen:          { y: 0.04 },        // Lifted clear of the console (its bezel sat 0.022 inside it). Add x: 0.1 to also clear the V's right tip
+    CenterConsoleScreen: { y: 0.04 }         // Same lift (its bezel sat 0.036 inside the console). Add the same x if you move the Life screen
+};
 
 // The Googie star lifts clear of the main frame (its rim is 0.1 above the star's underside), spins, then settles
 const HUD3D_STAR = { node: 'GoogieStar', lift: 0.12, turns: 2, duration: 1.1, ease: 'inOut' };
@@ -44,7 +51,8 @@ const HUD3D_WIRES = { node: 'Wires', bandDelay: 0.12, duration: 1.3, direction: 
 // frames: the left and right frame-bottom pieces this loadout uses (the others flip away)
 // pieces: everything sitting on top, and how it comes in. Leaving is the same motion played backward
 //   rise:   comes up from under the frame        { delay, duration, depth?, ease? }
-//   swing:  swings up from underneath, flipping  { delay, duration, ease? }
+//   swing:  swings up from underneath, flipping  { delay, duration, ease?, pivotY?, offset?: {x,y,z}, squash? }
+//           (offset: where it starts, as a shift that eases home. squash: its z-scale at the start, so it can tuck under the frame)
 //   expand: screens open wide, then tall         { delay, duration, screens: [screen material names], ease? }
 // Times are in seconds, from the start of that loadout's entrance
 
@@ -54,7 +62,7 @@ const HUD3D_LOADOUTS = {
         pieces: {
             BigRedButtonSetting: { rise: { delay: 0.00, duration: 0.35 } },
             BigRedButton:        { rise: { delay: 0.20, duration: 0.40 } },
-            BoomerangScreen:     { swing: { delay: 0.05, duration: 0.55 },
+            BoomerangScreen:     { swing: { delay: 0.05, duration: 0.55, offset: { z: 0.07 } },
                                    expand: { delay: 0.45, duration: 0.35, screens: ['ModeScreen'] } },
             Joystick:            { rise: { delay: 0.15, duration: 0.45 } },
             ButtonSettings:      { rise: { delay: 0.25, duration: 0.30 } },
@@ -172,6 +180,13 @@ class Hud3DMotion {
             if (!node) {
                 console.warn('[Hud3DMotion] No node named "' + name + '" in the model');
                 return;
+            }
+            const nudge = HUD3D_REST_OFFSETS[name];
+            if (nudge) {
+                node.position.x += nudge.x || 0;
+                node.position.y += nudge.y || 0;
+                node.position.z += nudge.z || 0;
+                node.updateMatrixWorld(true);
             }
             const box = new THREE.Box3().setFromObject(node);
             this.rest[name] = {
@@ -375,9 +390,18 @@ class Hud3DMotion {
         }
 
         if (spec.swing) {
-            const p = hud3dProgress(local, spec.swing);
-            const e = hud3dEase(spec.swing.ease)(p);
-            this._rotateAbout(name, HUD3D_SURFACE_Y, rest.pos.z, HUD3D_SWING_DIRECTION * Math.PI * (1 - e));
+            const sw = spec.swing;
+            const p = hud3dProgress(local, sw);
+            const e = hud3dEase(sw.ease)(p);
+            const pivotY = sw.pivotY !== undefined ? sw.pivotY : HUD3D_SURFACE_Y;
+            this._rotateAbout(name, pivotY, rest.pos.z, HUD3D_SWING_DIRECTION * Math.PI * (1 - e));
+            if (sw.offset) {
+                node.position.x += (sw.offset.x || 0) * (1 - e);
+                node.position.y += (sw.offset.y || 0) * (1 - e);
+                node.position.z += (sw.offset.z || 0) * (1 - e);
+            }
+            node.scale.copy(rest.scale);
+            if (sw.squash) node.scale.z = rest.scale.z * (1 + (sw.squash - 1) * (1 - e));
             if (p > 0) started = true;
         }
 
