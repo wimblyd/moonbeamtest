@@ -20,6 +20,7 @@
 // MOTION CONSTANTS
 // ============================================================================
 
+const HUD3D_MOTION_VERSION = '2026-11-26 flip direction + MHUD names';   // Shown on the test page
 const HUD3D_SURFACE_Y = 0.0;                     // Anything below this is hidden under the frames. Rising pieces start there
 const HUD3D_PHASE_GAP = 0.05;                    // Pause between the beats, in seconds
 const HUD3D_FLIP_DURATION = 0.9;                 // How long a frame piece takes to flip
