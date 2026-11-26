@@ -45,6 +45,7 @@
 
   <script src="three-bundle.js"></script>
   <script src="hud3d.js"></script>
+  <script src="hud3d_motion.js"></script>
   <script>
 
 // ============================================================================
@@ -54,19 +55,9 @@
 // Where the model lives next to this page. ?model=Some/Other.glb overrides it
 const modelUrl = new URLSearchParams(location.search).get('model') || 'Models/MHUD.glb';
 
-// Stand-ins for the real loadout state table: which pieces belong to which page.
-// (My best guess from the two PNG HUDs. Fix the lists to match your model)
-const MENU_ONLY = ['BoomerangScreen', 'BigRedButton', 'BigRedButtonSetting', 'Joystick'];
-const GAME_ONLY = [
-    'Radio', 'RadioDial', 'RadioPresets1', 'RadioPresets2', 'RadioPresets3', 'RadioAMFMHousing', 'RadioAMFMSlider',
-    'Points', 'LifeScreen', 'CenterConsoleScreen', 'PowerupScreen', 'DialScreens',
-    'RocketButton', 'ButtonBack', 'ButtonRefresh', 'ButtonPlayPause', 'Pause'
-];
-const ALWAYS_HIDDEN = ['Play'];            // Play swaps in for Pause later
-
 let hud3d = null;
-let loadout = 'game';
 let conservatoryShown = false;
+let slowMo = false;
 let hover = null;                          // { screen, x, y } while the pointer is over a screen
 const statsEl = document.getElementById('stats');
 
@@ -74,9 +65,21 @@ const statsEl = document.getElementById('stats');
 const missing = [];
 if (typeof THREE === 'undefined') missing.push('three-bundle.js');
 if (typeof initHud3D === 'undefined') missing.push('hud3d.js');
+if (typeof Hud3DMotion === 'undefined') missing.push('hud3d_motion.js');
 if (missing.length) {
     statsEl.textContent = 'Missing: ' + missing.join(', ') + '\nThey need to sit in the same folder as this page (see the browser console for 404s).';
     throw new Error('Missing ' + missing.join(', '));
+}
+
+// ...and say so when a file is there but OLD (a stale copy being served)
+const stale = [];
+if (typeof THREE.BufferAttribute !== 'function') stale.push('three-bundle.js');
+if (typeof HUD3D_VERSION === 'undefined') stale.push('hud3d.js');
+if (typeof HUD3D_MOTION_VERSION === 'undefined') stale.push('hud3d_motion.js');
+if (stale.length) {
+    statsEl.textContent = 'These files are OLD versions: ' + stale.join(', ') +
+        '\nThe page is being served an out-of-date copy. Check the repo, the Pages branch/folder, and the Actions tab.';
+    throw new Error('Old versions: ' + stale.join(', '));
 }
 
 // ============================================================================
@@ -166,23 +169,13 @@ function repaintAll() {
 }
 
 // ============================================================================
-// LOADOUT
-// ============================================================================
-
-function applyLoadout() {
-    MENU_ONLY.forEach(n => hud3d.setVisible(n, loadout === 'menu'));
-    GAME_ONLY.forEach(n => hud3d.setVisible(n, loadout === 'game'));
-    ALWAYS_HIDDEN.forEach(n => hud3d.setVisible(n, false));
-    hud3d.setVisible('RightScreen', conservatoryShown);
-}
-
-// ============================================================================
 // START
 // ============================================================================
 
 initHud3D(document.getElementById('hud3d'), { modelUrl: modelUrl }).then(hud => {
     hud3d = hud;
-    applyLoadout();
+    hud.motion = new Hud3DMotion(hud);
+    hud.motion.playEnter('game');                          // Open the way a page would: tops come in, wires build
 
     // Wait for the font so the static screens don't get painted with the fallback one
     (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(repaintAll);
@@ -200,9 +193,15 @@ initHud3D(document.getElementById('hud3d'), { modelUrl: modelUrl }).then(hud => 
 
     window.addEventListener('keydown', (e) => {
         const k = e.key.toLowerCase();
+        const m = hud.motion;
         if (k === 'f') hud.setFit(hud.fit === 'contain' ? 'cover' : 'contain');
-        if (k === 'l') { loadout = loadout === 'game' ? 'menu' : 'game'; applyLoadout(); }
-        if (k === 'h') { conservatoryShown = !conservatoryShown; applyLoadout(); }
+        if (k === 'l') m.transitionTo(m.current === 'game' ? 'menu' : 'game');                 // Animated switch
+        if (k === 'i') m.setLoadout(m.current === 'game' ? 'menu' : 'game');                   // Instant switch
+        if (k === 'e') m.playEnter(m.current);                                                 // Replay the page-open entrance
+        if (k === 'w') m.revealWires();
+        if (k === 'g') m.spinStar();
+        if (k === 's') { slowMo = !slowMo; m.timeScale = slowMo ? 0.25 : 1; }                  // Slow motion, to inspect
+        if (k === 'h') { conservatoryShown = !conservatoryShown; hud.setVisible('RightScreen', conservatoryShown); }
     });
 
     // Frame loop + stats
@@ -217,12 +216,13 @@ initHud3D(document.getElementById('hud3d'), { modelUrl: modelUrl }).then(hud => 
             const info = hud.renderer.info;
             const pixels = Object.values(hud.screens).reduce((sum, s) => sum + s.width * s.height, 0);
             statsEl.textContent =
+                'hud3d ' + HUD3D_VERSION + '  |  motion ' + HUD3D_MOTION_VERSION + '  |  three r' + THREE.REVISION + '  |  model ' + modelUrl + '\n' +
                 fps + ' fps   ' + info.render.calls + ' draw calls   ' + Math.round(info.render.triangles / 1000) + 'k tris\n' +
                 'canvases: ' + Object.keys(hud.screens).length + ' (' + (pixels / 1e6).toFixed(2) + ' Mpx total)   uploaded per frame: ' +
                 (hud.screens.MainScreen.width * hud.screens.MainScreen.height / 1e6).toFixed(2) + ' Mpx\n' +
-                'fit: ' + hud.fit + '   loadout: ' + loadout + '   under pointer: ' + (hud._lastHitName || '-') +
+                'fit: ' + hud.fit + '   loadout: ' + hud.motion.current + (hud.motion.busyNow ? ' (animating)' : '') + (slowMo ? '   SLOW-MO' : '') + '   under pointer: ' + (hud._lastHitName || '-') +
                 (hover ? '  canvas ' + Math.round(hover.x) + ', ' + Math.round(hover.y) : '') + '\n' +
-                '[F] contain/cover   [L] game/menu loadout   [H] conservatory screen';
+                '[L] animated switch  [I] instant switch  [E] replay entrance  [W] wires  [G] star  [S] slow-mo  [F] fit  [H] conservatory';
             frames = 0;
             lastStats = now;
         }
