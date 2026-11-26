@@ -16,6 +16,7 @@
 // HUD 3D CONSTANTS
 // ============================================================================
 
+const HUD3D_VERSION = '2026-11-26 planar UVs';  // Shown on the test page, so you can tell which copy of this file is live
 const HUD3D_MODEL_URL = 'Assets/Models/HUD.glb';
 const HUD3D_BG_COLOR = 0x003049;                 // Same as the window backgroundColor in main.js
 const HUD3D_PIXEL_RATIO_CAP = 1.5;               // Never render sharper than this on hi-dpi monitors (cheaper!)
