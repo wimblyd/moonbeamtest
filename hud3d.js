@@ -1,506 +1,587 @@
 // ============================================================================
-// HUD 3D MOTION
+// HUD 3D
 // ============================================================================
-// Loadout switching for the 3D HUD. A switch has three beats:
-//   1. The tops (screens, buttons, joystick...) retract
-//   2. The frame pieces flip over like a revolving panel, and the Googie star lifts, spins, and settles
-//   3. The new loadout's tops come in
+// Loads the HUD model (GLB) with three.js and turns every screen in it into a
+// regular 2D canvas the rest of the game can draw on.
 //
-// Needs hud3d.js (and three-bundle.js) loaded first.
+// Needs three-bundle.js loaded first (it provides the global THREE).
 //
-//   hud3d.motion = new Hud3DMotion(hud3d);
-//   hud3d.motion.setLoadout('game');            // Jump straight to a loadout, no animation
-//   hud3d.motion.transitionTo('menu');          // Animate there. Returns a Promise
-//   hud3d.motion.playExit('game');              // Leaving a page: retract, then flip to the next page's frames
-//   hud3d.motion.playEnter('game');             // Arriving on a page: tops come in (and the wires build)
-//   hud3d.motion.revealWires();                 // The rainbow builds across the top
-//   hud3d.motion.timeScale = 0.25;              // Slow motion, for inspecting
+//   const hud3d = await initHud3D(document.getElementById('hud3d'));
+//   const life = hud3d.screen('LivesScreen');     // { canvas, ctx, width, height, ... }
+//   life.ctx.fillText('3', 10, 40);
+//   life.markDirty();                             // upload it on the next render()
+//   hud3d.render();                               // once per frame, from the game loop
 
 // ============================================================================
-// MOTION CONSTANTS
+// HUD 3D CONSTANTS
 // ============================================================================
 
-const HUD3D_SURFACE_Y = 0.0;                     // Anything below this is hidden under the frames. Rising pieces start there
-const HUD3D_PHASE_GAP = 0.05;                    // Pause between the beats, in seconds
-const HUD3D_FLIP_DURATION = 0.9;                 // How long a frame piece takes to flip
-const HUD3D_FLIP_RIGHT_DELAY = 0.12;             // The right side follows the left, for a little ripple
-const HUD3D_FLIP_EASE = 'servo';                 // Clunks into place with a tiny overshoot
-const HUD3D_FRAME_AXIS = { y: -0.08, z: -2.52 }; // The line every frame piece flips around (bottom of the slab, center of the panel)
-const HUD3D_DEFAULT_EASE = 'inOut';
-const HUD3D_EXPAND_LINE = 0.03;                  // Screens open as a thin line first (fraction of their height)
+const HUD3D_MODEL_URL = 'Assets/Models/HUD.glb';
+const HUD3D_BG_COLOR = 0x003049;                 // Same as the window backgroundColor in main.js
+const HUD3D_PIXEL_RATIO_CAP = 1.5;               // Never render sharper than this on hi-dpi monitors (cheaper!)
 
-// The Googie star lifts clear of the main frame (its rim is 0.1 above the star's underside), spins, then settles
-const HUD3D_STAR = { node: 'GoogieStar', lift: 0.12, turns: 2, duration: 1.1, ease: 'inOut' };
+// Screens are found by the name of their MATERIAL in Blender
+const HUD3D_SCREEN_MATERIALS = [
+    'MainScreen', 'ModeScreen', 'JunkScreen', 'LowFuelScreen', 'DialScreen',
+    'LivesScreen', 'MoonbeamScreen', 'StardustScreen', 'PowerupMarqueeScreen',
+    'ConservatoryScreen', 'RadioFace'
+];
 
-// The wires build across the top. Each color band starts a beat after the last
-const HUD3D_WIRES = { node: 'Wires', bandDelay: 0.12, duration: 1.3, direction: 'ltr', ease: 'inOut' };   // ltr = left to right, rtl = right to left
-
-// ============================================================================
-// LOADOUTS
-// ============================================================================
-// frames: the left and right frame-bottom pieces this loadout uses (the others flip away)
-// pieces: everything sitting on top, and how it comes in. Leaving is the same motion played backward
-//   rise:   comes up from under the frame        { delay, duration, depth?, ease? }
-//   swing:  swings up from underneath, flipping  { delay, duration, ease? }
-//   expand: screens open wide, then tall         { delay, duration, screens: [screen material names], ease? }
-// Times are in seconds, from the start of that loadout's entrance
-
-const HUD3D_LOADOUTS = {
-    menu: {
-        frames: { left: 'LeftFrameBottom', right: 'RightFrameBottom' },
-        pieces: {
-            BigRedButtonSetting: { rise: { delay: 0.00, duration: 0.35 } },
-            BigRedButton:        { rise: { delay: 0.20, duration: 0.40 } },
-            BoomerangScreen:     { swing: { delay: 0.05, duration: 0.55 },
-                                   expand: { delay: 0.45, duration: 0.35, screens: ['ModeScreen'] } },
-            Joystick:            { rise: { delay: 0.15, duration: 0.45 } },
-            ButtonSettings:      { rise: { delay: 0.25, duration: 0.30 } },
-            ButtonHelp:          { rise: { delay: 0.32, duration: 0.30 } }
-        }
-    },
-    game: {
-        frames: { left: 'LeftFrameBottom2', right: 'RightFrameBottom2' },
-        pieces: {
-            Radio:               { rise: { delay: 0.00, duration: 0.30 },
-                                   expand: { delay: 0.30, duration: 0.35, screens: ['RadioFace'] } },
-            RadioDial:           { rise: { delay: 0.15, duration: 0.30 } },
-            RadioPresets1:       { rise: { delay: 0.20, duration: 0.28 } },
-            RadioPresets2:       { rise: { delay: 0.26, duration: 0.28 } },
-            RadioPresets3:       { rise: { delay: 0.32, duration: 0.28 } },
-            RadioAMFMHousing:    { rise: { delay: 0.20, duration: 0.28 } },
-            RadioAMFMSlider:     { rise: { delay: 0.30, duration: 0.28 } },
-            V:                   { rise: { delay: 0.35, duration: 0.28 } },
-            Points:              { rise: { delay: 0.00, duration: 0.30 },
-                                   expand: { delay: 0.30, duration: 0.40, screens: ['MoonbeamScreen', 'StardustScreen'] } },
-            LifeScreen:          { rise: { delay: 0.10, duration: 0.28 },
-                                   expand: { delay: 0.35, duration: 0.35, screens: ['LivesScreen'] } },
-            CenterConsoleScreen: { rise: { delay: 0.15, duration: 0.28 },
-                                   expand: { delay: 0.40, duration: 0.35, screens: ['JunkScreen'] } },
-            PowerupScreen:       { rise: { delay: 0.20, duration: 0.28 },
-                                   expand: { delay: 0.45, duration: 0.40, screens: ['PowerupMarqueeScreen'] } },
-            DialScreens:         { rise: { delay: 0.25, duration: 0.28 },
-                                   expand: { delay: 0.50, duration: 0.35, screens: ['DialScreen', 'LowFuelScreen'] } },
-            ButtonBack:          { rise: { delay: 0.20, duration: 0.30 } },
-            ButtonRefresh:       { rise: { delay: 0.26, duration: 0.30 } },
-            ButtonPlayPause:     { rise: { delay: 0.32, duration: 0.30 } },
-            Pause:               { rise: { delay: 0.32, duration: 0.30 } },
-            ButtonSettings:      { rise: { delay: 0.38, duration: 0.30 } },
-            ButtonHelp:          { rise: { delay: 0.44, duration: 0.30 } },
-            RocketButton:        { rise: { delay: 0.50, duration: 0.30 } }
-        }
-    }
+// Canvas sizing: small screens use a pixel density, the game window has a fixed width
+const HUD3D_SCREEN_DENSITY = 512;                // Canvas pixels per world unit (about 1:1 at 1080p)
+const HUD3D_SMALL_SCREEN_SCALE = 2;              // Oversample small screens so text stays crisp on big monitors
+const HUD3D_SCREENS = {
+    MainScreen: { width: 1600, live: true }      // The game window. Live = re-uploaded every frame
 };
 
-// ============================================================================
-// EASING
-// ============================================================================
+// Screens ignore the model's UVs by default: each one is projected straight down onto its own bounding box.
+// That makes rotated, flipped, tiny, or missing UV islands harmless. Set false to use the UVs from Blender
+const HUD3D_PLANAR_UVS = true;
 
-const HUD3D_EASE = {
-    linear: (t) => t,
-    out: (t) => 1 - Math.pow(1 - t, 3),
-    inOut: (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2),
-    // Eases out with a small overshoot, like a servo settling
-    servo: (t) => 1 + 2.1 * Math.pow(t - 1, 3) + 1.1 * Math.pow(t - 1, 2)
+// Nodes that start hidden
+const HUD3D_HIDDEN_NODES = ['RightScreen', 'Play']; // Conservatory screen waits until that part of the game exists. Play swaps in for Pause later
+
+// Light rig (the GLB has no lights). Tweak to taste
+const HUD3D_LIGHTS = {
+    hemiSky: 0xffffff,
+    hemiGround: 0x6a7a8a,
+    hemiIntensity: 1.6,
+    sunColor: 0xffffff,
+    sunIntensity: 2.2,
+    sunOffset: [-1.5, 5, -1.5]                   // From the middle of the HUD: left, up, and toward the top of the screen
 };
 
-// 'ratchet8' = inOut, but in 8 distinct ticks (any number works)
-function hud3dEase(name) {
-    if (HUD3D_EASE[name]) return HUD3D_EASE[name];
-    const m = /^ratchet(\d+)$/.exec(name || '');
-    if (m) {
-        const n = parseInt(m[1], 10);
-        return (t) => Math.round(HUD3D_EASE.inOut(t) * n) / n;
+// Used only if the GLB comes without its camera
+const HUD3D_FALLBACK_CAMERA = { fov: 22.9, aspect: 16 / 9, position: [2.417, 5.319, -3.359] };
+
+// ============================================================================
+// LOADING HELPERS
+// ============================================================================
+
+// XHR instead of fetch: it works from file:// inside Electron and over http
+function hud3dLoadBinary(url) {
+    return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, true);
+        xhr.responseType = 'arraybuffer';
+        xhr.onload = () => {
+            const ok = xhr.status === 200 || (xhr.status === 0 && xhr.response && xhr.response.byteLength > 0);
+            if (ok) resolve(xhr.response);
+            else reject(new Error('Could not load ' + url + ' (status ' + xhr.status + ')'));
+        };
+        xhr.onerror = () => reject(new Error('Could not load ' + url));
+        xhr.send();
+    });
+}
+
+// ============================================================================
+// SCREEN MEASUREMENT
+// ============================================================================
+
+// Works out two things for a screen mesh:
+//  - uvRect: the rectangle its UVs occupy (so the canvas can be mapped onto exactly that)
+//  - size3D: how big that rectangle is in the real world (so the canvas gets the right shape)
+function measureScreen(mesh) {
+    const geo = mesh.geometry;
+    const pos = geo.attributes.position;
+    const uv = geo.attributes.uv;
+    if (!uv) return null;
+
+    mesh.updateWorldMatrix(true, false);
+    const m = mesh.matrixWorld.elements;
+
+    // UV bounds
+    let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+    for (let i = 0; i < uv.count; i++) {
+        const u = uv.getX(i), v = uv.getY(i);
+        if (u < u0) u0 = u;
+        if (u > u1) u1 = u;
+        if (v < v0) v0 = v;
+        if (v > v1) v1 = v;
     }
-    return HUD3D_EASE[HUD3D_DEFAULT_EASE];
+
+    // World position of a vertex
+    const world = (i) => {
+        const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+        return [
+            m[0] * x + m[4] * y + m[8] * z + m[12],
+            m[1] * x + m[5] * y + m[9] * z + m[13],
+            m[2] * x + m[6] * y + m[10] * z + m[14]
+        ];
+    };
+
+    // World distance covered by one unit of U and one unit of V, averaged over the triangles
+    const index = geo.index;
+    const triCount = index ? index.count / 3 : pos.count / 3;
+    let sumU = 0, sumV = 0, sumW = 0;
+
+    for (let t = 0; t < triCount; t++) {
+        const ia = index ? index.getX(t * 3) : t * 3;
+        const ib = index ? index.getX(t * 3 + 1) : t * 3 + 1;
+        const ic = index ? index.getX(t * 3 + 2) : t * 3 + 2;
+
+        const pa = world(ia), pb = world(ib), pc = world(ic);
+        const e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+        const e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+
+        const a = uv.getX(ib) - uv.getX(ia), c = uv.getY(ib) - uv.getY(ia);
+        const b = uv.getX(ic) - uv.getX(ia), d = uv.getY(ic) - uv.getY(ia);
+        const det = a * d - b * c;
+        if (Math.abs(det) < 1e-12) continue;
+
+        // dP/dU and dP/dV
+        const du = [0, 1, 2].map(k => (e1[k] * d - e2[k] * c) / det);
+        const dv = [0, 1, 2].map(k => (e2[k] * a - e1[k] * b) / det);
+
+        // Weight by triangle area so big triangles count more than slivers
+        const cx = e1[1] * e2[2] - e1[2] * e2[1];
+        const cy = e1[2] * e2[0] - e1[0] * e2[2];
+        const cz = e1[0] * e2[1] - e1[1] * e2[0];
+        const w = Math.sqrt(cx * cx + cy * cy + cz * cz);
+
+        sumU += Math.hypot(du[0], du[1], du[2]) * w;
+        sumV += Math.hypot(dv[0], dv[1], dv[2]) * w;
+        sumW += w;
+    }
+    if (sumW === 0) return null;
+
+    return {
+        uvRect: { u0: u0, u1: u1, v0: v0, v1: v1 },
+        size3D: { w: (u1 - u0) * (sumU / sumW), h: (v1 - v0) * (sumV / sumW) }
+    };
 }
 
-function hud3dClamp01(v) {
-    return v < 0 ? 0 : v > 1 ? 1 : v;
-}
+// Replaces a screen mesh's UVs with a straight top-down projection onto its own bounding box,
+// so the canvas always lands upright and the right way around. Same return shape as measureScreen
+function planarizeScreen(mesh) {
+    const geo = mesh.geometry;
+    const pos = geo.attributes.position;
+    mesh.updateWorldMatrix(true, false);
+    const m = mesh.matrixWorld.elements;
 
-// Progress (0 to 1) of a sub-motion, given the time since its piece's timeline started
-function hud3dProgress(t, m) {
-    return hud3dClamp01((t - m.delay) / m.duration);
+    const wx = new Float32Array(pos.count);
+    const wz = new Float32Array(pos.count);
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (let i = 0; i < pos.count; i++) {
+        const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+        wx[i] = m[0] * x + m[4] * y + m[8] * z + m[12];
+        wz[i] = m[2] * x + m[6] * y + m[10] * z + m[14];
+        if (wx[i] < x0) x0 = wx[i];
+        if (wx[i] > x1) x1 = wx[i];
+        if (wz[i] < z0) z0 = wz[i];
+        if (wz[i] > z1) z1 = wz[i];
+    }
+    const w = x1 - x0, h = z1 - z0;
+    if (w <= 0 || h <= 0) return null;
+
+    // u runs left to right, v runs top to bottom (the way a canvas does)
+    const uv = new Float32Array(pos.count * 2);
+    for (let i = 0; i < pos.count; i++) {
+        uv[i * 2] = (wx[i] - x0) / w;
+        uv[i * 2 + 1] = (wz[i] - z0) / h;
+    }
+    geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+
+    return { uvRect: { u0: 0, u1: 1, v0: 0, v1: 1 }, size3D: { w: w, h: h } };
 }
 
 // ============================================================================
-// MOTION
+// SCREEN
 // ============================================================================
 
-class Hud3DMotion {
-    constructor(hud) {
-        this.hud = hud;
-        this.loadouts = HUD3D_LOADOUTS;
-        this.timeScale = 1;
-        this.current = null;                     // The loadout the HUD is in (or heading to, once an animation finishes)
-        this.tracks = [];                        // Running animations
-        this.busy = null;                        // The running transition, if any
-        this.rest = {};                          // Node name -> its resting pose
-        this.wireBands = [];
+class Hud3DScreen {
+    constructor(name, mesh, metrics, width, height, live, headless) {
+        this.name = name;
+        this.mesh = mesh;
+        this.uvRect = metrics.uvRect;
+        this.size3D = metrics.size3D;
+        this.width = width;
+        this.height = height;
+        this.live = live;               // Live screens are uploaded every frame
+        this.dirty = true;              // Everything else only when marked dirty
+        this.canvas = null;
+        this.ctx = null;
+        this.texture = null;
 
-        this._captureRest();
-        this._setupWires();
+        if (headless) return;
+
+        this.canvas = document.createElement('canvas');
+        this.canvas.width = width;
+        this.canvas.height = height;
+        this.ctx = this.canvas.getContext('2d');
+        this.ctx.fillStyle = '#000';
+        this.ctx.fillRect(0, 0, width, height);
+
+        // Map the canvas onto the screen's UV rectangle (whatever shape it was unwrapped as)
+        const du = this.uvRect.u1 - this.uvRect.u0;
+        const dv = this.uvRect.v1 - this.uvRect.v0;
+        const texture = new THREE.CanvasTexture(this.canvas);
+        texture.flipY = false;                          // glTF UVs start at the top left, like a canvas
+        texture.colorSpace = THREE.SRGBColorSpace;
+        texture.generateMipmaps = false;                // No mipmaps: cheaper to upload, and screens never shrink much
+        texture.minFilter = THREE.LinearFilter;
+        texture.magFilter = THREE.LinearFilter;
+        texture.repeat.set(1 / du, 1 / dv);
+        texture.offset.set(-this.uvRect.u0 / du, -this.uvRect.v0 / dv);
+        this.texture = texture;
+
+        // Screens glow: unlit, so the canvas colors show exactly as drawn (and it's cheaper to shade)
+        const material = new THREE.MeshBasicMaterial({ map: texture });
+        material.name = name;
+        material.toneMapped = false;
+        if (mesh.material && mesh.material.dispose) mesh.material.dispose();
+        mesh.material = material;
+    }
+
+    // Call after drawing on a non-live screen so the next render() uploads it
+    markDirty() {
+        this.dirty = true;
+    }
+}
+
+// ============================================================================
+// HUD 3D
+// ============================================================================
+
+class Hud3D {
+    constructor(canvas, options) {
+        this.canvas = canvas;                           // The visible <canvas> three.js renders into
+        this.options = Object.assign({ modelUrl: HUD3D_MODEL_URL, fit: 'contain', antialias: true, headless: false }, options);
+        this.renderer = null;
+        this.scene = null;
+        this.camera = null;
+        this.designAspect = 16 / 9;                     // The aspect ratio the HUD was framed for
+        this.baseFov = 22.9;                            // ...and the vertical field of view that goes with it
+        this.screens = {};                              // Material name -> Hud3DScreen
+        this.nodes = {};                                // Top-level node name -> Object3D
+        this.pickables = [];                            // The only meshes the raycaster bothers with
+        this.fit = this.options.fit;                    // 'contain' shows the whole HUD, 'cover' fills the window
+        this.motion = null;                             // Set to a Hud3DMotion (hud3d_motion.js) to animate loadout changes
+        this._lastTime = 0;
+        this._ray = null;
+        this._ndc = null;
+    }
+
+    // Loads the GLB and sets everything up. Resolves with this
+    load() {
+        return hud3dLoadBinary(this.options.modelUrl).then(buffer => this.loadFromBuffer(buffer));
+    }
+
+    loadFromBuffer(buffer) {
+        // Say what is wrong instead of letting the parser throw something cryptic
+        const magic = String.fromCharCode.apply(null, new Uint8Array(buffer, 0, Math.min(4, buffer.byteLength)));
+        if (buffer.byteLength < 12 || magic !== 'glTF') {
+            const peek = new TextDecoder().decode(new Uint8Array(buffer, 0, Math.min(60, buffer.byteLength))).replace(/\s+/g, ' ');
+            return Promise.reject(new Error('That is not a GLB: the server sent ' + buffer.byteLength + ' bytes' +
+                (peek ? ' starting with "' + peek + '"' : ' (an empty file)')));
+        }
+
+        return new Promise((resolve, reject) => {
+            new THREE.GLTFLoader().parse(buffer, '', gltf => {
+                try {
+                    this._setup(gltf);
+                    resolve(this);
+                } catch (err) {
+                    reject(err);
+                }
+            }, reject);
+        });
     }
 
     // ------------------------------------------------------------------------
     // Setup
     // ------------------------------------------------------------------------
 
-    _allNodeNames() {
-        const names = {};
-        for (const key in this.loadouts) {
-            const L = this.loadouts[key];
-            names[L.frames.left] = true;
-            names[L.frames.right] = true;
-            for (const piece in L.pieces) names[piece] = true;
+    _setup(gltf) {
+        this.scene = gltf.scene;
+        this.scene.updateMatrixWorld(true);
+
+        // Index the top-level nodes by name (the HUD is a flat list of pieces)
+        this.scene.children.forEach(child => {
+            this.nodes[child.name] = child;
+        });
+
+        this._setupCamera(gltf);
+        this._setupLights();
+        this._setupScreens();
+
+        HUD3D_HIDDEN_NODES.forEach(name => this.setVisible(name, false));
+
+        this._ray = new THREE.Raycaster();
+        this._ndc = new THREE.Vector2();
+
+        if (!this.options.headless) {
+            this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: this.options.antialias });
+            this.renderer.setClearColor(HUD3D_BG_COLOR);
+            this.resize();
+            window.addEventListener('resize', () => this.resize());
         }
-        names[HUD3D_STAR.node] = true;
-        return Object.keys(names);
     }
 
-    // Remembers where every animated piece rests, and how deep it has to sink to vanish under the frame
-    _captureRest() {
-        this._allNodeNames().forEach(name => {
-            const node = this.hud.nodes[name];
-            if (!node) {
-                console.warn('[Hud3DMotion] No node named "' + name + '" in the model');
+    _setupCamera(gltf) {
+        // Use the camera the HUD was framed with in Blender
+        this.camera = gltf.cameras && gltf.cameras[0];
+        if (!this.camera) {
+            const f = HUD3D_FALLBACK_CAMERA;
+            this.camera = new THREE.PerspectiveCamera(f.fov, f.aspect, 0.1, 1000);
+            this.camera.position.set(f.position[0], f.position[1], f.position[2]);
+            this.camera.rotation.set(-Math.PI / 2, 0, 0);
+            this.scene.add(this.camera);
+        }
+        this.baseFov = this.camera.fov;
+        this.designAspect = this.camera.aspect || 16 / 9;
+        this.scene.updateMatrixWorld(true);
+    }
+
+    _setupLights() {
+        const L = HUD3D_LIGHTS;
+        const box = new THREE.Box3().setFromObject(this.scene);
+        const mid = box.getCenter(new THREE.Vector3());
+
+        this.scene.add(new THREE.HemisphereLight(L.hemiSky, L.hemiGround, L.hemiIntensity));
+
+        const sun = new THREE.DirectionalLight(L.sunColor, L.sunIntensity);
+        sun.position.set(mid.x + L.sunOffset[0], mid.y + L.sunOffset[1], mid.z + L.sunOffset[2]);
+        sun.target.position.copy(mid);
+        this.scene.add(sun);
+        this.scene.add(sun.target);
+    }
+
+    _setupScreens() {
+        const found = [];
+        this.scene.traverse(obj => {
+            if (obj.isMesh && obj.material && HUD3D_SCREEN_MATERIALS.indexOf(obj.material.name) >= 0) found.push(obj);
+        });
+
+        found.forEach(mesh => {
+            const name = mesh.material.name;
+            const metrics = HUD3D_PLANAR_UVS ? planarizeScreen(mesh) : measureScreen(mesh);
+            if (!metrics) {
+                console.warn('[Hud3D] Screen "' + name + '" has no usable UVs, skipping it');
                 return;
             }
-            const box = new THREE.Box3().setFromObject(node);
-            this.rest[name] = {
-                pos: node.position.clone(),
-                quat: node.quaternion.clone(),
-                scale: node.scale.clone(),
-                depth: Math.max(0.1, box.max.y - HUD3D_SURFACE_Y + 0.01)
-            };
-        });
-    }
 
-    // Each wire band gets its own copy of its material (the originals are shared with buttons), so it can be clipped on its own
-    _setupWires() {
-        const node = this.hud.nodes[HUD3D_WIRES.node];
-        if (!node) return;
-        const box = new THREE.Box3().setFromObject(node);
-        this.wireRange = { x0: box.min.x - 0.01, x1: box.max.x + 0.01 };
-
-        node.traverse(obj => {
-            if (!obj.isMesh) return;
-            obj.material = obj.material.clone();
-            this.wireBands.push({ material: obj.material, plane: new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0) });
-        });
-    }
-
-    // ------------------------------------------------------------------------
-    // Public
-    // ------------------------------------------------------------------------
-
-    // Jumps straight to a loadout. tops = false leaves the tops hidden (for playEnter)
-    setLoadout(name, tops) {
-        this._settle(name, tops !== false);
-    }
-
-    // Animates from the current loadout to another: retract, flip, enter
-    transitionTo(name) {
-        if (this.busy) return this.busy.promise;
-        if (!this.current) this._settle(name, true);
-        if (name === this.current) return Promise.resolve();
-        return this._run(this._plan(this.current, name, { exit: true, flip: true, enter: true }));
-    }
-
-    // Page is closing: retract, then flip to the frames the next page starts with. Tops stay hidden
-    playExit(toName) {
-        if (this.busy) return this.busy.promise;
-        return this._run(this._plan(this.current, toName, { exit: true, flip: true, enter: false }));
-    }
-
-    // Page just opened: frames are already in place, the tops come in, and the wires build
-    playEnter(name, withWires) {
-        this._settle(name, false);
-        if (withWires !== false) this.revealWires();
-        return this._run(this._plan(name, name, { exit: false, flip: false, enter: true }));
-    }
-
-    // The Googie star: lift, spin, settle
-    spinStar() {
-        return this._start({ duration: HUD3D_STAR.duration, apply: (t) => this._poseStar(t / HUD3D_STAR.duration), finish: () => this._poseStar(0) });
-    }
-
-    // The wires build across the top
-    revealWires() {
-        if (!this.wireBands.length) return Promise.resolve();
-        const total = HUD3D_WIRES.duration + HUD3D_WIRES.bandDelay * (this.wireBands.length - 1);
-        this.wireBands.forEach(b => {
-            b.material.clippingPlanes = [b.plane];
-            b.material.needsUpdate = true;
-        });
-        if (this.hud.renderer) this.hud.renderer.localClippingEnabled = true;
-        return this._start({
-            duration: total,
-            apply: (t) => this._poseWires(t),
-            finish: () => this.wireBands.forEach(b => {
-                b.material.clippingPlanes = null;        // Done: stop paying for the clipping
-                b.material.needsUpdate = true;
-            })
-        });
-    }
-
-    get busyNow() {
-        return this.tracks.length > 0;
-    }
-
-    // Call once per frame (hud3d.render() does this for you)
-    update(dt) {
-        const step = dt * this.timeScale;
-        for (let i = this.tracks.length - 1; i >= 0; i--) {
-            const track = this.tracks[i];
-            track.t += step;
-            const t = Math.min(track.t, track.duration);
-            track.apply(t);
-            if (track.t >= track.duration) {
-                this.tracks.splice(i, 1);
-                if (track.finish) track.finish();
-                track.resolve();
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------------
-    // Scheduling
-    // ------------------------------------------------------------------------
-
-    _start(track) {
-        track.t = 0;
-        track.promise = new Promise(resolve => { track.resolve = resolve; });
-        this.tracks.push(track);
-        track.apply(0);
-        return track.promise;
-    }
-
-    _run(plan) {
-        const track = {
-            duration: plan.total,
-            apply: (t) => this._applyPlan(plan, t),
-            finish: () => {
-                this._settle(plan.to, plan.parts.enter);
-                this.busy = null;
-            }
-        };
-        this.busy = track;
-        return this._start(track);
-    }
-
-    // How long a loadout's entrance takes: the last piece to finish
-    _span(loadout) {
-        let span = 0;
-        for (const name in loadout.pieces) {
-            const spec = loadout.pieces[name];
-            ['rise', 'swing', 'expand'].forEach(k => {
-                if (spec[k]) span = Math.max(span, spec[k].delay + spec[k].duration);
-            });
-        }
-        return span;
-    }
-
-    _plan(from, to, parts) {
-        const exitSpan = parts.exit ? this._span(this.loadouts[from]) : 0;
-        const flipStart = exitSpan + (parts.exit ? HUD3D_PHASE_GAP : 0);
-        const flipSpan = parts.flip ? HUD3D_FLIP_DURATION + HUD3D_FLIP_RIGHT_DELAY : 0;
-        const enterStart = flipStart + flipSpan + (parts.flip ? HUD3D_PHASE_GAP : 0);
-        const enterSpan = parts.enter ? this._span(this.loadouts[to]) : 0;
-        let total = enterStart + enterSpan;
-        if (parts.flip) total = Math.max(total, flipStart + HUD3D_STAR.duration);
-        return { from: from, to: to, parts: parts, exitSpan: exitSpan, flipStart: flipStart, enterStart: enterStart, total: total };
-    }
-
-    // ------------------------------------------------------------------------
-    // Posing
-    // ------------------------------------------------------------------------
-
-    _applyPlan(plan, t) {
-        const F = this.loadouts[plan.from];
-        const T = this.loadouts[plan.to];
-        const parts = plan.parts;
-
-        // Tops: leaving ones play their entrance backward, entering ones play it forward
-        const names = {};
-        if (parts.exit) for (const n in F.pieces) names[n] = true;
-        if (parts.enter) for (const n in T.pieces) names[n] = true;
-
-        for (const name in names) {
-            const inFrom = parts.exit && F.pieces[name];
-            const inTo = parts.enter && T.pieces[name];
-            let spec, local;
-            if (inTo && t >= plan.enterStart) { spec = inTo; local = t - plan.enterStart; }
-            else if (inFrom) { spec = inFrom; local = plan.exitSpan - t; }
-            else { spec = inTo; local = t - plan.enterStart; }
-            this._posePiece(name, spec, local);
-        }
-
-        // Frames: one flips away as the other flips in
-        if (parts.flip) {
-            ['left', 'right'].forEach(side => {
-                const outName = F.frames[side];
-                const inName = T.frames[side];
-                if (outName === inName) return;
-                const delay = side === 'right' ? HUD3D_FLIP_RIGHT_DELAY : 0;
-                const p = hud3dClamp01((t - plan.flipStart - delay) / HUD3D_FLIP_DURATION);
-                this._poseFlip(outName, inName, hud3dEase(HUD3D_FLIP_EASE)(p), p);
-            });
-            this._poseStar(hud3dClamp01((t - plan.flipStart) / HUD3D_STAR.duration));
-        }
-    }
-
-    // Sets a piece's pose from the time since its own timeline started
-    _posePiece(name, spec, local) {
-        const node = this.hud.nodes[name];
-        const rest = this.rest[name];
-        if (!node || !rest) return;
-
-        let started = false;
-
-        if (spec.rise) {
-            const p = hud3dProgress(local, spec.rise);
-            const e = hud3dEase(spec.rise.ease)(p);
-            const depth = spec.rise.depth || rest.depth;
-            node.position.copy(rest.pos);
-            node.position.y = rest.pos.y - depth * (1 - e);
-            if (p > 0) started = true;
-        }
-
-        if (spec.swing) {
-            const p = hud3dProgress(local, spec.swing);
-            const e = hud3dEase(spec.swing.ease)(p);
-            this._rotateAbout(name, HUD3D_SURFACE_Y, rest.pos.z, Math.PI * (1 - e));
-            if (p > 0) started = true;
-        }
-
-        if (spec.expand) {
-            const p = hud3dProgress(local, spec.expand);
-            const ease = hud3dEase(spec.expand.ease);
-            const w = ease(hud3dClamp01(p / 0.5));
-            const h = ease(hud3dClamp01((p - 0.5) / 0.5));
-            spec.expand.screens.forEach(screenName => {
-                const screen = this.hud.screens[screenName];
-                if (!screen) return;
-                screen.mesh.visible = p > 0;
-                screen.mesh.scale.set(Math.max(w, 1e-4), 1, HUD3D_EXPAND_LINE + (1 - HUD3D_EXPAND_LINE) * h);
-            });
-            if (p > 0) started = true;
-        }
-
-        node.visible = started;
-    }
-
-    // Rotates a piece about a line parallel to X, through (y0, z0), starting from its rest pose
-    _rotateAbout(name, y0, z0, angle) {
-        const node = this.hud.nodes[name];
-        const rest = this.rest[name];
-        const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), angle);
-        const pivot = new THREE.Vector3(rest.pos.x, y0, z0);
-        node.position.copy(rest.pos).sub(pivot).applyQuaternion(q).add(pivot);
-        node.quaternion.copy(q).multiply(rest.quat);
-    }
-
-    // The outgoing frame turns over and away while the incoming one turns up from underneath
-    _poseFlip(outName, inName, e, p) {
-        const out = this.hud.nodes[outName];
-        const inn = this.hud.nodes[inName];
-        this._rotateAbout(outName, HUD3D_FRAME_AXIS.y, HUD3D_FRAME_AXIS.z, Math.PI * e);
-        this._rotateAbout(inName, HUD3D_FRAME_AXIS.y, HUD3D_FRAME_AXIS.z, Math.PI * e - Math.PI);
-        out.visible = p < 1;
-        inn.visible = p > 0;
-    }
-
-    _poseStar(p) {
-        const node = this.hud.nodes[HUD3D_STAR.node];
-        const rest = this.rest[HUD3D_STAR.node];
-        if (!node || !rest) return;
-        const ease = hud3dEase(HUD3D_STAR.ease);
-
-        // Up, hold, down
-        let lift = 1;
-        if (p < 0.2) lift = ease(p / 0.2);
-        else if (p > 0.8) lift = 1 - ease((p - 0.8) / 0.2);
-        if (p <= 0 || p >= 1) lift = 0;
-
-        // Spin while it is up there
-        const spin = Math.PI * 2 * HUD3D_STAR.turns * ease(hud3dClamp01((p - 0.15) / 0.7));
-        node.position.copy(rest.pos);
-        node.position.y += HUD3D_STAR.lift * lift;
-        node.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), spin).multiply(rest.quat);
-    }
-
-    _poseWires(t) {
-        const ease = hud3dEase(HUD3D_WIRES.ease);
-        const ltr = HUD3D_WIRES.direction !== 'rtl';
-        const r = this.wireRange;
-        this.wireBands.forEach((band, i) => {
-            const p = hud3dClamp01((t - i * HUD3D_WIRES.bandDelay) / HUD3D_WIRES.duration);
-            const e = ease(p);
-            if (ltr) {
-                const edge = r.x0 + (r.x1 - r.x0) * e;      // Keep everything left of the edge
-                band.plane.normal.set(-1, 0, 0);
-                band.plane.constant = edge;
+            // Canvas size: fixed width (game window) or pixel density (everything else)
+            const cfg = Object.assign({}, HUD3D_SCREENS[name], this.options.screens && this.options.screens[name]);
+            const aspect = metrics.size3D.h / metrics.size3D.w;
+            let width, height;
+            if (cfg.width) {
+                width = cfg.width;
+                height = Math.round(width * aspect);
             } else {
-                const edge = r.x1 - (r.x1 - r.x0) * e;      // Keep everything right of the edge
-                band.plane.normal.set(1, 0, 0);
-                band.plane.constant = -edge;
+                const scale = cfg.scale || HUD3D_SMALL_SCREEN_SCALE;
+                width = Math.max(16, Math.round(metrics.size3D.w * HUD3D_SCREEN_DENSITY * scale));
+                height = Math.max(8, Math.round(metrics.size3D.h * HUD3D_SCREEN_DENSITY * scale));
             }
+
+            const screen = new Hud3DScreen(name, mesh, metrics, width, height, !!cfg.live, this.options.headless);
+            mesh.userData.hud3dScreen = screen;
+            this.screens[name] = screen;
+            this.pickables.push(mesh);
+
+            // Pivot at the screen's own center, so it can scale from the middle (a node's origin is usually elsewhere).
+            // Only for pieces grouped under a node: a lone mesh carries the node's own transform
+            if (mesh.parent && mesh.parent !== this.scene) {
+                mesh.geometry.computeBoundingBox();
+                const c = mesh.geometry.boundingBox.getCenter(new THREE.Vector3());
+                mesh.geometry.translate(-c.x, -c.y, -c.z);
+                mesh.position.add(c);
+            }
+        });
+        this.scene.updateMatrixWorld(true);
+    }
+
+    // ------------------------------------------------------------------------
+    // Sizing
+    // ------------------------------------------------------------------------
+
+    resize() {
+        this._fit(window.innerWidth, window.innerHeight);
+    }
+
+    setFit(mode) {
+        this.fit = mode;
+        if (this.renderer) this.resize();
+    }
+
+    // Keeps the HUD's framing at any window shape.
+    //  contain: the whole HUD always fits (bars show on the sides or top)
+    //  cover:   the window is always filled (the edges of the HUD can get cropped)
+    _fit(width, height) {
+        const aspect = width / height;
+        const ratio = this.designAspect / aspect;
+        const scale = this.fit === 'cover' ? Math.min(1, ratio) : Math.max(1, ratio);
+        const toRad = Math.PI / 180;
+
+        this.camera.fov = (2 * Math.atan(Math.tan(this.baseFov * toRad / 2) * scale)) / toRad;
+        this.camera.aspect = aspect;
+        this.camera.updateProjectionMatrix();
+
+        if (this.renderer) {
+            this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, HUD3D_PIXEL_RATIO_CAP));
+            this.renderer.setSize(width, height);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Frame
+    // ------------------------------------------------------------------------
+
+    // Call once per frame. Only screens that changed get uploaded
+    render() {
+        if (!this.renderer) return;
+
+        // Time since the last frame, for the motion engine (capped so a stalled tab doesn't jump)
+        const now = performance.now();
+        const dt = this._lastTime ? Math.min(0.05, (now - this._lastTime) / 1000) : 0;
+        this._lastTime = now;
+        if (this.motion) this.motion.update(dt);
+
+        for (const name in this.screens) {
+            const s = this.screens[name];
+            if (s.live || s.dirty) {
+                s.texture.needsUpdate = true;
+                s.dirty = false;
+            }
+        }
+        this.renderer.render(this.scene, this.camera);
+    }
+
+    // ------------------------------------------------------------------------
+    // Access
+    // ------------------------------------------------------------------------
+
+    screen(name) {
+        return this.screens[name] || null;
+    }
+
+    node(name) {
+        return this.nodes[name] || null;
+    }
+
+    setVisible(name, visible) {
+        const node = this.nodes[name];
+        if (node) node.visible = visible;
+    }
+
+    // Makes a node (a button, say) clickable for pick()
+    addPickable(name) {
+        const node = this.nodes[name];
+        if (!node) return;
+        node.traverse(obj => {
+            if (obj.isMesh && this.pickables.indexOf(obj) < 0) this.pickables.push(obj);
         });
     }
 
     // ------------------------------------------------------------------------
-    // Resting states
+    // Picking
     // ------------------------------------------------------------------------
 
-    _reset(name) {
-        const node = this.hud.nodes[name];
-        const rest = this.rest[name];
-        if (!node || !rest) return;
-        node.position.copy(rest.pos);
-        node.quaternion.copy(rest.quat);
-        node.scale.copy(rest.scale);
+    // What is under this window position? Returns null, or
+    // { name, object, point, screen, canvasX, canvasY } (screen and canvas coordinates only for screens)
+    pick(clientX, clientY) {
+        const rect = this.canvas.getBoundingClientRect();
+        this._ndc.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+        this._ray.setFromCamera(this._ndc, this.camera);
+
+        const hits = this._ray.intersectObjects(this.pickables, false);
+        for (let i = 0; i < hits.length; i++) {
+            const hit = hits[i];
+            if (!this._isShown(hit.object)) continue;       // The raycaster doesn't care about visibility
+
+            const result = { name: this._ownerName(hit.object), object: hit.object, point: hit.point, screen: null, canvasX: 0, canvasY: 0 };
+            const screen = hit.object.userData.hud3dScreen;
+            if (screen && hit.uv) {
+                const r = screen.uvRect;
+                result.screen = screen;
+                result.canvasX = ((hit.uv.x - r.u0) / (r.u1 - r.u0)) * screen.width;
+                result.canvasY = ((hit.uv.y - r.v0) / (r.v1 - r.v0)) * screen.height;
+            }
+            return result;
+        }
+        return null;
     }
 
-    _resetScreens(spec) {
-        if (!spec.expand) return;
-        spec.expand.screens.forEach(screenName => {
-            const screen = this.hud.screens[screenName];
-            if (!screen) return;
-            screen.mesh.scale.set(1, 1, 1);
-            screen.mesh.visible = true;
+    _isShown(obj) {
+        for (let o = obj; o; o = o.parent) {
+            if (!o.visible) return false;
+        }
+        return true;
+    }
+
+    // The top-level node a mesh belongs to (so a primitive of "Points" reports "Points")
+    _ownerName(obj) {
+        let o = obj;
+        while (o.parent && o.parent !== this.scene) o = o.parent;
+        return o.name;
+    }
+
+    // ------------------------------------------------------------------------
+    // Input forwarding
+    // ------------------------------------------------------------------------
+
+    // Feeds mouse input on a screen to an existing 2D canvas, as if it were still sitting on the page.
+    // The target canvas gets hidden, which makes getBoundingClientRect() return zeros, so the
+    // coordinates we send are used as-is by the old mouse code (control.js needs no changes)
+    forwardToCanvas(screenName, target) {
+        const screen = this.screens[screenName];
+        if (!screen) return;
+
+        target.style.display = 'none';
+        let captured = false;
+        let last = { x: 0, y: 0 };
+
+        const send = (type, x, y, e) => {
+            target.dispatchEvent(new MouseEvent(type, {
+                clientX: x, clientY: y, button: e.button || 0, buttons: e.buttons || 0, cancelable: true
+            }));
+        };
+        const onScreen = (e) => {
+            const hit = this.pick(e.clientX, e.clientY);
+            return hit && hit.screen === screen ? hit : null;
+        };
+
+        this.canvas.addEventListener('pointerdown', (e) => {
+            const hit = onScreen(e);
+            if (!hit) return;
+            captured = true;
+            this.canvas.setPointerCapture(e.pointerId);     // Keep the drag even when the pointer leaves the screen
+            last = { x: hit.canvasX, y: hit.canvasY };
+            send('mousedown', last.x, last.y, e);
+        });
+
+        this.canvas.addEventListener('pointermove', (e) => {
+            const hit = onScreen(e);
+            if (hit) {
+                last = { x: hit.canvasX, y: hit.canvasY };
+                send('mousemove', last.x, last.y, e);
+                this.canvas.style.cursor = target.style.cursor || 'default';   // The game sets grab / pointer / grabbing on its canvas
+            } else if (!captured) {
+                this.canvas.style.cursor = 'default';
+            }
+        });
+
+        this.canvas.addEventListener('pointerup', (e) => {
+            if (!captured) return;
+            captured = false;
+            const hit = onScreen(e);
+            send('mouseup', last.x, last.y, e);             // Off the screen? Release where it last was
+            if (hit) send('click', hit.canvasX, hit.canvasY, e);
         });
     }
+}
 
-    // Puts everything at rest: this loadout's frames and (optionally) tops shown, every other piece hidden
-    _settle(name, tops) {
-        const target = this.loadouts[name];
-        for (const key in this.loadouts) {
-            const L = this.loadouts[key];
-            const isTarget = key === name;
-            [L.frames.left, L.frames.right].forEach(f => {
-                this._reset(f);
-                if (this.hud.nodes[f]) this.hud.nodes[f].visible = isTarget;
-            });
-            for (const piece in L.pieces) {
-                if (isTarget) continue;
-                if (target.pieces[piece]) continue;     // Shared with the target: handled below
-                this._reset(piece);
-                this._resetScreens(L.pieces[piece]);
-                if (this.hud.nodes[piece]) this.hud.nodes[piece].visible = false;
-            }
-        }
-        for (const piece in target.pieces) {
-            this._reset(piece);
-            this._resetScreens(target.pieces[piece]);
-            if (this.hud.nodes[piece]) this.hud.nodes[piece].visible = tops;
-        }
-        this._reset(HUD3D_STAR.node);
-        this.current = name;
-    }
+// ============================================================================
+// INIT
+// ============================================================================
+
+// Creates the HUD and loads it. Resolves with the Hud3D
+function initHud3D(canvas, options) {
+    const hud = new Hud3D(canvas, options);
+    return hud.load();
 }
 
 // Export if using modules (the smoke test does)
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { Hud3DMotion, HUD3D_LOADOUTS, hud3dEase };
+    module.exports = { Hud3D, Hud3DScreen, measureScreen, planarizeScreen, initHud3D, HUD3D_SCREEN_MATERIALS };
 }
